@@ -27,8 +27,12 @@ import (
 )
 
 const (
-	bytesPerSample  = 2
-	audioPacketType = transport.StreamTypeSpeechAudio
+	bytesPerSample    = 2
+	audioPacketType   = transport.StreamTypeSpeechAudio
+	outputModePacket  = "packet"
+	outputModeAudio   = "audio"
+	outputEncodingPCM = "pcm"
+	outputEncodingWAV = "wav"
 )
 
 var emitSignalFunc = sdk.EmitSignal
@@ -40,6 +44,18 @@ type SileroVAD struct {
 	storageOnce sync.Once
 	storage     *storage.StorageManager
 	storageErr  error
+}
+
+type vadStreamContext struct {
+	engine          *SileroVAD
+	logger          *slog.Logger
+	out             chan<- sdkengram.StreamMessage
+	state           *streamState
+	coalesceDur     time.Duration
+	coalesceMax     time.Duration
+	coalesceBuffers map[string]*coalesceBuffer
+	sawAudio        bool
+	sawBinary       bool
 }
 
 func New() *SileroVAD {
@@ -58,140 +74,196 @@ func (e *SileroVAD) Init(ctx context.Context, cfg cfgpkg.Config, secrets *sdkeng
 	return nil
 }
 
-func (e *SileroVAD) Stream(ctx context.Context, in <-chan sdkengram.StreamMessage, out chan<- sdkengram.StreamMessage) error {
+func (e *SileroVAD) Stream(
+	ctx context.Context,
+	in <-chan sdkengram.InboundMessage,
+	out chan<- sdkengram.StreamMessage,
+) error {
 	logger := sdk.LoggerFromContext(ctx).With("component", "silero-vad")
-	_ = e.storageManager(ctx)
-	state := newStreamState(e.cfg, logger)
-	coalesceDur := time.Duration(e.cfg.CoalesceDurationMs) * time.Millisecond
-	coalesceMax := time.Duration(e.cfg.CoalesceMaxDurationMs) * time.Millisecond
-	coalesceBuffers := make(map[string]*coalesceBuffer)
-	defer func() {
-		for _, cb := range coalesceBuffers {
-			cb.flush()
-			cb.stop()
-		}
-		state.close()
-	}()
-	sawAudio := false
-	sawBinary := false
-
-	getCoalesceBuffer := func(key string, room roomInfo, participant participantInfo) *coalesceBuffer {
-		if cb, ok := coalesceBuffers[key]; ok {
-			return cb
-		}
-		cb := newCoalesceBuffer(coalesceDur, coalesceMax, func(merged turnChunk) {
-			seq := state.nextSequence(key)
-			durationMs := calcDurationMs(len(merged.PCM), merged.SampleRate, merged.Channels)
-			logger.Info("emitting coalesced VAD turn",
-				"participant", key,
-				"sequence", seq,
-				"bytes", len(merged.PCM),
-				"durationMs", durationMs,
-			)
-			state.logOutputPCMStats(key, merged.PCM, merged.SampleRate, merged.Channels)
-			_ = e.sendTurn(ctx, logger, out, room, participant, merged, seq)
-		})
-		coalesceBuffers[key] = cb
-		return cb
-	}
-
-	flushPending := func() error {
-		for _, cb := range coalesceBuffers {
-			cb.flush()
-		}
-		return state.flushAll(func(key string, ctxInfo participantContext, chunk turnChunk, sequence int) error {
-			participant := ctxInfo.participant
-			if participant.Identity == "" {
-				participant.Identity = key
-			}
-			state.logOutputPCMStats(key, chunk.PCM, chunk.SampleRate, chunk.Channels)
-			return e.sendTurn(ctx, logger, out, ctxInfo.room, participant, chunk, sequence)
-		})
-	}
+	stream := newVADStreamContext(e, logger, out)
+	defer stream.close()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if err := flushPending(); err != nil {
+			if err := stream.flushPending(ctx); err != nil {
 				return err
 			}
 			return ctx.Err()
 		case msg, ok := <-in:
 			if !ok {
-				return flushPending()
+				return stream.flushPending(ctx)
 			}
-			if !sawAudio && msg.Audio != nil && len(msg.Audio.PCM) > 0 {
-				logger.Info(
-					"received first audio frame",
-					"pcmLen", len(msg.Audio.PCM),
-					"sampleRate", msg.Audio.SampleRateHz,
-					"channels", msg.Audio.Channels,
-					"codec", msg.Audio.Codec,
-				)
-				sawAudio = true
-			}
-			if !sawBinary && msg.Binary != nil && len(msg.Binary.Payload) > 0 {
-				logger.Info(
-					"received first binary frame",
-					"mimeType", msg.Binary.MimeType,
-					"payloadLen", len(msg.Binary.Payload),
-				)
-				sawBinary = true
-			}
-			pkt, ok, err := packetFromStreamMessage(msg)
-			if err != nil {
-				logger.Error("failed to parse audio packet", "error", err)
-				continue
-			}
-			if !ok {
-				if isHeartbeat(msg.Metadata) {
-					continue
-				}
-				logger.Warn("ignoring message without payload", "metadata", msg.Metadata)
-				continue
-			}
-			if !isSupportedAudioPacket(pkt.Type) {
-				e.logIgnoredPacket(ctx, logger, &pkt, "non-audio type")
-				continue
-			}
-			if len(pkt.Audio.Data) == 0 {
-				e.logIgnoredPacket(ctx, logger, &pkt, "empty audio payload")
-				continue
-			}
-			if pkt.Audio.SampleRate <= 0 {
-				pkt.Audio.SampleRate = 48000
-			}
-			if pkt.Audio.Channels <= 0 {
-				pkt.Audio.Channels = 1
-			}
-			e.logDetectorInput(ctx, logger, &pkt)
-			chunks, err := state.ingest(pkt)
-			if err != nil {
-				logger.Error("failed to process audio", "error", err)
-				continue
-			}
-			for _, chunk := range chunks {
-				participantKey := pkt.Participant.Identity
-				if participantKey == "" {
-					participantKey = pkt.Participant.SID
-				}
-				if participantKey == "" {
-					participantKey = "default"
-				}
-				cb := getCoalesceBuffer(participantKey, pkt.Room, pkt.Participant)
-				cb.add(chunk)
-			}
+			stream.handleMessage(ctx, msg)
 		}
 	}
 }
 
-func packetFromStreamMessage(msg sdkengram.StreamMessage) (audioPacket, bool, error) {
+func newVADStreamContext(
+	engine *SileroVAD,
+	logger *slog.Logger,
+	out chan<- sdkengram.StreamMessage,
+) *vadStreamContext {
+	return &vadStreamContext{
+		engine:          engine,
+		logger:          logger,
+		out:             out,
+		state:           newStreamState(engine.cfg, logger),
+		coalesceDur:     time.Duration(engine.cfg.CoalesceDurationMs) * time.Millisecond,
+		coalesceMax:     time.Duration(engine.cfg.CoalesceMaxDurationMs) * time.Millisecond,
+		coalesceBuffers: make(map[string]*coalesceBuffer),
+	}
+}
+
+func (s *vadStreamContext) close() {
+	for _, cb := range s.coalesceBuffers {
+		cb.flush()
+		cb.stop()
+	}
+	s.state.close()
+}
+
+func (s *vadStreamContext) handleMessage(
+	ctx context.Context,
+	msg sdkengram.InboundMessage,
+) {
+	s.observeFirstFrames(msg)
+	pkt, ok, err := packetFromStreamMessage(msg)
+	if err != nil {
+		s.logger.Error("failed to parse audio packet", "error", err)
+		msg.Done()
+		return
+	}
+	if !ok {
+		s.handleEmptyMessage(msg)
+		return
+	}
+	if !isSupportedAudioPacket(pkt.Type) {
+		s.engine.logIgnoredPacket(ctx, s.logger, &pkt, "non-audio type")
+		msg.Done()
+		return
+	}
+	if len(pkt.Audio.Data) == 0 {
+		s.engine.logIgnoredPacket(ctx, s.logger, &pkt, "empty audio payload")
+		msg.Done()
+		return
+	}
+
+	normalizeAudioPacket(&pkt)
+	s.engine.logDetectorInput(ctx, s.logger, &pkt)
+	chunks, err := s.state.ingest(pkt)
+	if err != nil {
+		s.logger.Error("failed to process audio", "error", err)
+		msg.Done()
+		return
+	}
+	participantKey := resolveParticipantKey(pkt.Participant)
+	for _, chunk := range chunks {
+		s.getCoalesceBuffer(ctx, participantKey, pkt.Room, pkt.Participant).add(chunk)
+	}
+	msg.Done()
+}
+
+func (s *vadStreamContext) observeFirstFrames(msg sdkengram.InboundMessage) {
+	if !s.sawAudio && msg.Audio != nil && len(msg.Audio.PCM) > 0 {
+		s.logger.Info(
+			"received first audio frame",
+			"pcmLen", len(msg.Audio.PCM),
+			"sampleRate", msg.Audio.SampleRateHz,
+			"channels", msg.Audio.Channels,
+			"codec", msg.Audio.Codec,
+		)
+		s.sawAudio = true
+	}
+	if !s.sawBinary && msg.Binary != nil && len(msg.Binary.Payload) > 0 {
+		s.logger.Info(
+			"received first binary frame",
+			"mimeType", msg.Binary.MimeType,
+			"payloadLen", len(msg.Binary.Payload),
+		)
+		s.sawBinary = true
+	}
+}
+
+func (s *vadStreamContext) handleEmptyMessage(msg sdkengram.InboundMessage) {
+	if isHeartbeat(msg.Metadata) {
+		msg.Done()
+		return
+	}
+	s.logger.Warn("ignoring message without payload", "metadata", msg.Metadata)
+	msg.Done()
+}
+
+func (s *vadStreamContext) getCoalesceBuffer(
+	ctx context.Context,
+	key string,
+	room roomInfo,
+	participant participantInfo,
+) *coalesceBuffer {
+	if cb, ok := s.coalesceBuffers[key]; ok {
+		return cb
+	}
+
+	cb := newCoalesceBuffer(s.coalesceDur, s.coalesceMax, func(merged turnChunk) {
+		seq := s.state.nextSequence(key)
+		durationMs := calcDurationMs(len(merged.PCM), merged.SampleRate, merged.Channels)
+		s.logger.Info("emitting coalesced VAD turn",
+			"participant", key,
+			"sequence", seq,
+			"bytes", len(merged.PCM),
+			"durationMs", durationMs,
+		)
+		s.state.logOutputPCMStats(key, merged.PCM, merged.SampleRate, merged.Channels)
+		_ = s.engine.sendTurn(ctx, s.logger, s.out, room, participant, merged, seq)
+	})
+	s.coalesceBuffers[key] = cb
+	return cb
+}
+
+func (s *vadStreamContext) flushPending(ctx context.Context) error {
+	for _, cb := range s.coalesceBuffers {
+		cb.flush()
+	}
+	return s.state.flushAll(func(key string, ctxInfo participantContext, chunk turnChunk, sequence int) error {
+		participant := ctxInfo.participant
+		if participant.Identity == "" {
+			participant.Identity = key
+		}
+		s.state.logOutputPCMStats(key, chunk.PCM, chunk.SampleRate, chunk.Channels)
+		return s.engine.sendTurn(ctx, s.logger, s.out, ctxInfo.room, participant, chunk, sequence)
+	})
+}
+
+func resolveParticipantKey(participant participantInfo) string {
+	if participant.Identity != "" {
+		return participant.Identity
+	}
+	if participant.SID != "" {
+		return participant.SID
+	}
+	return "default"
+}
+
+func normalizeAudioPacket(pkt *audioPacket) {
+	if pkt == nil {
+		return
+	}
+	if pkt.Audio.SampleRate <= 0 {
+		pkt.Audio.SampleRate = 48000
+	}
+	if pkt.Audio.Channels <= 0 {
+		pkt.Audio.Channels = 1
+	}
+}
+
+func packetFromStreamMessage(msg sdkengram.InboundMessage) (audioPacket, bool, error) {
 	if msg.Audio == nil || len(msg.Audio.PCM) == 0 {
-		if msg.Binary == nil || len(msg.Binary.Payload) == 0 {
+		raw := streamStructuredBytes(msg)
+		if len(raw) == 0 {
 			return audioPacket{}, false, nil
 		}
 		var pkt audioPacket
-		if err := json.Unmarshal(msg.Binary.Payload, &pkt); err != nil {
+		if err := json.Unmarshal(raw, &pkt); err != nil {
 			return audioPacket{}, false, err
 		}
 		return pkt, true, nil
@@ -220,9 +292,22 @@ func packetFromStreamMessage(msg sdkengram.StreamMessage) (audioPacket, bool, er
 		},
 	}
 	if pkt.Audio.Encoding == "" {
-		pkt.Audio.Encoding = "pcm"
+		pkt.Audio.Encoding = outputEncodingPCM
 	}
 	return pkt, true, nil
+}
+
+func streamStructuredBytes(msg sdkengram.InboundMessage) []byte {
+	if len(msg.Inputs) > 0 {
+		return msg.Inputs
+	}
+	if len(msg.Payload) > 0 {
+		return msg.Payload
+	}
+	if msg.Binary != nil && len(msg.Binary.Payload) > 0 {
+		return msg.Binary.Payload
+	}
+	return nil
 }
 
 func (e *SileroVAD) storageManager(ctx context.Context) *storage.StorageManager {
@@ -240,61 +325,21 @@ func (e *SileroVAD) storageManager(ctx context.Context) *storage.StorageManager 
 	return e.storage
 }
 
-func (e *SileroVAD) sendTurn(ctx context.Context, logger *slog.Logger, out chan<- sdkengram.StreamMessage, room roomInfo, participant participantInfo, chunk turnChunk, sequence int) error {
-	if e.cfg.OutputSampleRateHz > 0 && e.cfg.OutputSampleRateHz != chunk.SampleRate {
-		if chunk.Channels != 1 {
-			logger.Warn(
-				"output resample requested but channels != 1; skipping",
-				"requestedSampleRate", e.cfg.OutputSampleRateHz,
-				"inputSampleRate", chunk.SampleRate,
-				"channels", chunk.Channels,
-			)
-		} else {
-			int16pcm, err := bytesToInt16LE(chunk.PCM)
-			if err != nil {
-				logger.Warn(
-					"failed to decode PCM for resample; keeping original",
-					"inputSampleRate", chunk.SampleRate,
-					"error", err,
-				)
-				goto buildPayload
-			}
-			resampled, err := resampleInt16Mono(int16pcm, chunk.SampleRate, e.cfg.OutputSampleRateHz)
-			if err != nil {
-				logger.Warn(
-					"failed to resample output audio; keeping original",
-					"requestedSampleRate", e.cfg.OutputSampleRateHz,
-					"inputSampleRate", chunk.SampleRate,
-					"error", err,
-				)
-			} else {
-				chunk.PCM = int16ToBytesLE(resampled)
-				chunk.SampleRate = e.cfg.OutputSampleRateHz
-			}
-		}
+func (e *SileroVAD) sendTurn(
+	ctx context.Context,
+	logger *slog.Logger,
+	out chan<- sdkengram.StreamMessage,
+	room roomInfo,
+	participant participantInfo,
+	chunk turnChunk,
+	sequence int,
+) error {
+	if logger == nil {
+		logger = sdk.LoggerFromContext(ctx)
 	}
-buildPayload:
-	outputMode := strings.ToLower(strings.TrimSpace(e.cfg.OutputMode))
-	if outputMode == "" {
-		outputMode = "packet"
-	}
-	payloadAudio := audioBuffer{
-		Encoding:   strings.ToLower(e.cfg.OutputEncoding),
-		SampleRate: chunk.SampleRate,
-		Channels:   chunk.Channels,
-		Data:       chunk.PCM,
-	}
-	if outputMode == "audio" {
-		if payloadAudio.Encoding != "pcm" && payloadAudio.Encoding != "" {
-			logger.Warn(
-				"audio output ignores non-PCM encoding; forcing pcm",
-				"encoding", payloadAudio.Encoding,
-			)
-		}
-		payloadAudio.Encoding = "pcm"
-	} else if payloadAudio.Encoding == "wav" {
-		payloadAudio.Data = wrapPCMAsWAV(chunk.PCM, chunk.SampleRate, chunk.Channels)
-	}
+	chunk = e.resampleTurnChunk(logger, chunk)
+	outputMode := resolveOutputMode(e.cfg.OutputMode)
+	payloadAudio := e.buildPayloadAudio(logger, outputMode, chunk)
 	logger.Info(
 		"emitting VAD turn",
 		"sampleRate", payloadAudio.SampleRate,
@@ -303,33 +348,9 @@ buildPayload:
 		"detectorSampleRate", e.cfg.DetectorSampleRate,
 	)
 
-	if outputMode != "audio" && e.storage != nil && e.cfg.InlineAudioLimit > 0 {
-		scope := []string{}
-		if participant.Identity != "" {
-			scope = append(scope, participant.Identity)
-		}
-		if participant.SID != "" {
-			scope = append(scope, participant.SID)
-		}
-		if room.Name != "" {
-			scope = append(scope, room.Name)
-		}
-		storyRun := strings.TrimSpace(e.storyInfo.StoryRunID)
-		stepName := strings.TrimSpace(e.storyInfo.StepName)
-		ref, err := media.MaybeOffloadBlob(ctx, e.storage, payloadAudio.Data, media.WriteOptions{
-			Namespace:   room.SID,
-			StoryRun:    storyRun,
-			Step:        stepName,
-			Scope:       scope,
-			ContentType: "audio/L16",
-			InlineLimit: e.cfg.InlineAudioLimit,
-		})
-		if err == nil && ref != nil {
-			e.logStorageDecision(ctx, logger, participant.Identity, true, len(payloadAudio.Data), nil)
-			payloadAudio.Storage = ref
-			payloadAudio.Data = nil
-		} else if err != nil {
-			e.logStorageDecision(ctx, logger, participant.Identity, false, len(payloadAudio.Data), err)
+	if outputMode != outputModeAudio {
+		if err := e.maybeOffloadTurnAudio(ctx, logger, room, participant, &payloadAudio); err != nil {
+			return err
 		}
 	}
 
@@ -344,15 +365,168 @@ buildPayload:
 		Audio:       payloadAudio,
 	}
 	e.logDetectorOutput(ctx, logger, &packet)
+	if err := e.emitTurnMessage(ctx, out, outputMode, participant.Identity, sequence, payloadAudio, packet); err != nil {
+		return err
+	}
+	e.emitTurnSignal(ctx, logger, room, participant, payloadAudio, sequence, durationMs)
+	return nil
+}
+
+func (e *SileroVAD) resampleTurnChunk(
+	logger *slog.Logger,
+	chunk turnChunk,
+) turnChunk {
+	if e.cfg.OutputSampleRateHz <= 0 || e.cfg.OutputSampleRateHz == chunk.SampleRate {
+		return chunk
+	}
+	if chunk.Channels != 1 {
+		logger.Warn(
+			"output resample requested but channels != 1; skipping",
+			"requestedSampleRate", e.cfg.OutputSampleRateHz,
+			"inputSampleRate", chunk.SampleRate,
+			"channels", chunk.Channels,
+		)
+		return chunk
+	}
+
+	int16pcm, err := bytesToInt16LE(chunk.PCM)
+	if err != nil {
+		logger.Warn(
+			"failed to decode PCM for resample; keeping original",
+			"inputSampleRate", chunk.SampleRate,
+			"error", err,
+		)
+		return chunk
+	}
+	resampled, err := resampleInt16Mono(int16pcm, chunk.SampleRate, e.cfg.OutputSampleRateHz)
+	if err != nil {
+		logger.Warn(
+			"failed to resample output audio; keeping original",
+			"requestedSampleRate", e.cfg.OutputSampleRateHz,
+			"inputSampleRate", chunk.SampleRate,
+			"error", err,
+		)
+		return chunk
+	}
+	chunk.PCM = int16ToBytesLE(resampled)
+	chunk.SampleRate = e.cfg.OutputSampleRateHz
+	return chunk
+}
+
+func resolveOutputMode(value string) string {
+	outputMode := strings.ToLower(strings.TrimSpace(value))
+	if outputMode == "" {
+		return outputModePacket
+	}
+	return outputMode
+}
+
+func (e *SileroVAD) buildPayloadAudio(
+	logger *slog.Logger,
+	outputMode string,
+	chunk turnChunk,
+) audioBuffer {
+	payloadAudio := audioBuffer{
+		Encoding:   strings.ToLower(e.cfg.OutputEncoding),
+		SampleRate: chunk.SampleRate,
+		Channels:   chunk.Channels,
+		Data:       chunk.PCM,
+	}
+	if outputMode == outputModeAudio {
+		if payloadAudio.Encoding != outputEncodingPCM && payloadAudio.Encoding != "" {
+			logger.Warn(
+				"audio output ignores non-PCM encoding; forcing pcm",
+				"encoding", payloadAudio.Encoding,
+			)
+		}
+		payloadAudio.Encoding = outputEncodingPCM
+		return payloadAudio
+	}
+	if payloadAudio.Encoding == outputEncodingWAV {
+		payloadAudio.Data = wrapPCMAsWAV(chunk.PCM, chunk.SampleRate, chunk.Channels)
+	}
+	return payloadAudio
+}
+
+func (e *SileroVAD) maybeOffloadTurnAudio(
+	ctx context.Context,
+	logger *slog.Logger,
+	room roomInfo,
+	participant participantInfo,
+	payloadAudio *audioBuffer,
+) error {
+	if payloadAudio == nil || e.cfg.InlineAudioLimit <= 0 {
+		return nil
+	}
+	if len(payloadAudio.Data) <= e.cfg.InlineAudioLimit {
+		return nil
+	}
+	if e.storageManager(ctx) == nil {
+		if e.storageErr != nil {
+			return fmt.Errorf(
+				"audio turn exceeds inline limit %d and shared storage is unavailable: %w",
+				e.cfg.InlineAudioLimit,
+				e.storageErr,
+			)
+		}
+		return fmt.Errorf(
+			"audio turn exceeds inline limit %d and shared storage is unavailable",
+			e.cfg.InlineAudioLimit,
+		)
+	}
+
+	scope := buildTurnScope(room, participant)
+	ref, err := media.MaybeOffloadBlob(ctx, e.storage, payloadAudio.Data, media.WriteOptions{
+		Namespace:   room.SID,
+		StoryRun:    strings.TrimSpace(e.storyInfo.StoryRunID),
+		Step:        strings.TrimSpace(e.storyInfo.StepName),
+		Scope:       scope,
+		ContentType: offloadContentType(payloadAudio.Encoding),
+		InlineLimit: e.cfg.InlineAudioLimit,
+	})
+	if err == nil && ref != nil {
+		e.logStorageDecision(ctx, logger, participant.Identity, true, len(payloadAudio.Data), nil)
+		payloadAudio.Storage = ref
+		payloadAudio.Data = nil
+		return nil
+	}
+	if err != nil {
+		e.logStorageDecision(ctx, logger, participant.Identity, false, len(payloadAudio.Data), err)
+	}
+	return nil
+}
+
+func buildTurnScope(room roomInfo, participant participantInfo) []string {
+	scope := []string{}
+	if participant.Identity != "" {
+		scope = append(scope, participant.Identity)
+	}
+	if participant.SID != "" {
+		scope = append(scope, participant.SID)
+	}
+	if room.Name != "" {
+		scope = append(scope, room.Name)
+	}
+	return scope
+}
+
+func (e *SileroVAD) emitTurnMessage(
+	ctx context.Context,
+	out chan<- sdkengram.StreamMessage,
+	outputMode string,
+	participant string,
+	sequence int,
+	payloadAudio audioBuffer,
+	packet turnPacket,
+) error {
 	metadata := map[string]string{
 		"source":      "silero",
 		"type":        transport.StreamTypeSpeechVADActive,
 		"provider":    "silero",
-		"participant": participant.Identity,
+		"participant": participant,
 		"sequence":    strconv.Itoa(sequence),
 	}
-
-	if outputMode == "audio" {
+	if outputMode == outputModeAudio {
 		select {
 		case out <- sdkengram.StreamMessage{
 			Audio: &sdkengram.AudioFrame{
@@ -363,7 +537,6 @@ buildPayload:
 			},
 			Metadata: metadata,
 		}:
-			e.emitTurnSignal(ctx, logger, room, participant, payloadAudio, sequence, durationMs)
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -374,23 +547,36 @@ buildPayload:
 	if err != nil {
 		return err
 	}
-
 	select {
 	case out <- sdkengram.StreamMessage{
+		Payload: body,
 		Binary: &sdkengram.BinaryFrame{
 			Payload:  body,
 			MimeType: "application/json",
 		},
 		Metadata: metadata,
 	}:
-		e.emitTurnSignal(ctx, logger, room, participant, payloadAudio, sequence, durationMs)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (e *SileroVAD) emitTurnSignal(ctx context.Context, logger *slog.Logger, room roomInfo, participant participantInfo, audio audioBuffer, sequence, durationMs int) {
+func offloadContentType(encoding string) string {
+	if strings.EqualFold(strings.TrimSpace(encoding), "wav") {
+		return "audio/wav"
+	}
+	return "audio/L16"
+}
+
+func (e *SileroVAD) emitTurnSignal(
+	ctx context.Context,
+	logger *slog.Logger,
+	room roomInfo,
+	participant participantInfo,
+	audio audioBuffer,
+	sequence, durationMs int,
+) {
 	payload := map[string]any{
 		"type":       "speech.turn.v1",
 		"sequence":   sequence,
@@ -552,7 +738,9 @@ func (s *streamState) logOutputPCMStats(key string, data []byte, sampleRate, cha
 	)
 }
 
-func (s *streamState) flushAll(handler func(key string, ctx participantContext, chunk turnChunk, sequence int) error) error {
+func (s *streamState) flushAll(
+	handler func(key string, ctx participantContext, chunk turnChunk, sequence int) error,
+) error {
 	for speakerID, speaker := range s.speakers {
 		chunks := speaker.flush()
 		ctxInfo := s.contexts[speakerID]

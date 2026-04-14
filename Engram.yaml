@@ -1,0 +1,120 @@
+apiVersion: catalog.bubustack.io/v1alpha1
+kind: EngramTemplate
+metadata:
+  name: silero-vad
+  annotations:
+    registry.bubustack.io/maturity: experimental
+spec:
+  version: 0.1.0
+  description: "Silero ONNX-based VAD that emits speech.vad.active payloads."
+  image: ghcr.io/bubustack/silero-vad-engram:0.1.0
+  supportedModes:
+    - deployment
+    - job
+  configSchema:
+    type: object
+    properties:
+      modelPath:
+        type: string
+        default: /models/silero_vad.onnx
+        description: Filesystem path to the Silero ONNX model.
+      detectorSampleRateHz:
+        type: integer
+        enum: [8000, 16000]
+        default: 16000
+        description: Sample rate used by the Silero model.
+      outputSampleRateHz:
+        type: integer
+        default: 0
+        description: Optional output sample rate (Hz). 0 keeps input rate.
+      outputMode:
+        type: string
+        enum: [packet, audio]
+        default: packet
+        description: Output format. packet emits speech.vad.active payloads; audio emits PCM audio frames plus VAD signals.
+      threshold:
+        type: number
+        minimum: 0.001
+        maximum: 0.95
+        default: 0.5
+        description: Speech activation probability threshold.
+      frameDurationMs:
+        type: integer
+        default: 32
+        description: Frame duration consumed per VAD decision.
+      minSilenceDurationMs:
+        type: integer
+        default: 400
+        description: Minimum trailing silence to close a turn.
+      minDurationMs:
+        type: integer
+        default: 200
+        description: Minimum speech duration required to emit a turn.
+      maxDurationMs:
+        type: integer
+        default: 12000
+        description: Hard cap on a single buffered turn.
+      outputEncoding:
+        type: string
+        enum: [wav, pcm]
+        default: wav
+        description: Encoding for emitted audio buffers.
+      inlineAudioLimit:
+        type: integer
+        default: 65536
+        description: Inline audio byte budget before offloading to shared storage.
+      coalesceDurationMs:
+        type: integer
+        default: 0
+        description: Optional merge window that combines adjacent turns for the same participant before emission. 0 disables coalescing.
+      coalesceMaxDurationMs:
+        type: integer
+        default: 30000
+        description: Maximum duration for a coalesced turn before forced emission. Only applies when coalesceDurationMs > 0.
+  inputSchema:
+    type: object
+    properties:
+      type:
+        const: speech.audio.v1
+      room:
+        type: object
+      participant:
+        type: object
+      audio:
+        type: object
+        properties:
+          encoding: { type: string }
+          sampleRate: { type: integer }
+          channels: { type: integer }
+          data: { type: string }
+  outputSchema:
+    type: object
+    properties:
+      type:
+        const: speech.vad.active
+      participant:
+        type: object
+      sequence:
+        type: integer
+      durationMs:
+        type: integer
+      audio:
+        type: object
+        properties:
+          encoding: { type: string }
+          sampleRate: { type: integer }
+          channels: { type: integer }
+          data: { type: string }
+          storage:
+            type: object
+            properties:
+              path: { type: string }
+              contentType: { type: string }
+              sizeBytes: { type: integer }
+  execution:
+    service:
+      ports:
+        - name: grpc
+          protocol: TCP
+          port: 50051
+          targetPort: 50051
