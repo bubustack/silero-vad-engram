@@ -16,6 +16,37 @@ jobs:
       - name: Clone the code
         uses: actions/checkout@v6
 
+      - name: Install ONNX Runtime headers and libraries
+        run: |
+          set -euo pipefail
+
+          ORT_VERSION=1.18.1
+          case "$(uname -m)" in
+            x86_64)
+              ORT_PACKAGE="onnxruntime-linux-x64-${ORT_VERSION}"
+              ;;
+            aarch64|arm64)
+              ORT_PACKAGE="onnxruntime-linux-aarch64-${ORT_VERSION}"
+              ;;
+            *)
+              echo "Unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          curl -L -o /tmp/onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_PACKAGE}.tgz"
+          sudo rm -rf /opt/onnxruntime "/opt/${ORT_PACKAGE}"
+          sudo tar -C /opt -xzf /tmp/onnxruntime.tgz
+          sudo mv "/opt/${ORT_PACKAGE}" /opt/onnxruntime
+
+          {
+            echo "LD_LIBRARY_PATH=/opt/onnxruntime/lib"
+            echo "LIBRARY_PATH=/opt/onnxruntime/lib"
+            echo "C_INCLUDE_PATH=/opt/onnxruntime/include"
+            echo "CGO_LDFLAGS=-L/opt/onnxruntime/lib"
+            echo "CGO_CFLAGS=-I/opt/onnxruntime/include"
+          } >> "$GITHUB_ENV"
+
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
