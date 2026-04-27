@@ -3,7 +3,7 @@ module github.com/bubustack/silero-vad-engram
 go 1.26.2
 
 require (
-	github.com/bubustack/bobrapet v0.1.9
+	github.com/bubustack/bobrapet v0.1.12
 	github.com/bubustack/bubu-sdk-go v0.1.4
 	github.com/bubustack/tractatus v0.1.4
 	github.com/streamer45/silero-vad-go v0.2.1
